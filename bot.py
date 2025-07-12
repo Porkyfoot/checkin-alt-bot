@@ -1,177 +1,119 @@
 # bot.py
 import logging
-from datetime import time, date
+from datetime import date, time
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from telegram import ReplyKeyboardMarkup, KeyboardButton, Update
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, ConversationHandler, filters
 )
 
-# --- константы состояний разговора ---
-(
-    STATE_NAME,
-    STATE_STATUS,
-    STATE_REMOTE_REASON,
-    STATE_SHOOT_DETAILS,
-    STATE_VACATION_DATES,
-) = range(5)
+# Состояния
+(STATE_NAME, STATE_STATUS, STATE_REMOTE_REASON, STATE_SHOOT_DETAILS, STATE_VACATION_DATES) = range(5)
 
-# Google-сборы
+# Константы
 SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-CREDS_FILE = "/etc/secrets/credentials.json"
-SPREADSHEET_ID = "ваш-ID-таблицы"
+CREDS_FILE = "credentials.json"
+SPREADSHEET_ID = "1sqyMu6iLnT1nxDckQO7BjjIhdVwzLsBAA_lib1eoQ_M"
 EMPLOYEE_SHEET = "Employees"
 STATUS_SHEET = "Status"
-
-# Telegram
 TOKEN = "7591731653:AAEdN2b6HiF0jAvEtEP8n5hzhSbl94cu4fg"
 
-# Keyboard
-main_menu = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("🏢 Уже в офисе"), KeyboardButton("🏠 Удалённо")],
-        [KeyboardButton("🎨 На съёмках"), KeyboardButton("🌴 В отпуске")],
-        [KeyboardButton("📋 Список сотрудников")],
-    ],
-    resize_keyboard=True,
-)
+main_menu = ReplyKeyboardMarkup([
+    [KeyboardButton("🏢 Уже в офисе"), KeyboardButton("🏠 Удалённо")],
+    [KeyboardButton("🎨 На съёмках"), KeyboardButton("🌴 В отпуске")],
+    [KeyboardButton("🚫 Dayoff"), KeyboardButton("📋 Список сотрудников")],
+], resize_keyboard=True)
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPE)
     client = gspread.authorize(creds)
     emp_ws = client.open_by_key(SPREADSHEET_ID).worksheet(EMPLOYEE_SHEET)
-
-    rows = emp_ws.get_all_records()
-    ids = [str(r.get("Telegram ID", "")).strip() for r in rows]
-
-    current_id = str(update.effective_user.id).strip()
-    logger.info(f"User ID: {current_id}, existing IDs: {ids}")
-
-    if current_id not in ids:
-        await update.message.reply_text("Пожалуйста, представьтесь: Фамилия Имя (русскими буквами).")
+    ids = [str(r["Telegram ID"]) for r in emp_ws.get_all_records()]
+    if str(update.effective_user.id) not in ids:
+        await update.message.reply_text("Как вас зовут? (Фамилия Имя)")
         return STATE_NAME
-
-    await update.message.reply_text("Выбери статус на сегодня:", reply_markup=main_menu)
+    await update.message.reply_text("Выберите статус на сегодня:", reply_markup=main_menu)
     return STATE_STATUS
-
 
 async def name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPE)
     client = gspread.authorize(creds)
     emp_ws = client.open_by_key(SPREADSHEET_ID).worksheet(EMPLOYEE_SHEET)
-
-    fullname = update.message.text.strip()
-    user_id = str(update.effective_user.id).strip()
-
-    emp_ws.append_row([fullname, user_id])
-    await update.message.reply_text("Записал. Теперь выбери статус:", reply_markup=main_menu)
+    emp_ws.append_row([update.message.text.strip(), str(update.effective_user.id)])
+    await update.message.reply_text("Записал. Теперь выберите статус:", reply_markup=main_menu)
     return STATE_STATUS
 
-
-async def handle_office(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await save_status(update, "Офис", "")
-    await update.message.reply_text("Отметил — вы в офисе.")
-    return ConversationHandler.END
-
-
-async def handle_remote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Напиши кратко причину удалёнки (болею, дома жду доставку и т.п.)")
-    return STATE_REMOTE_REASON
-
-
-async def remote_reason_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    reason = update.message.text.strip()
-    await save_status(update, "Удалённо", reason)
-    await update.message.reply_text("Отметил — вы на удалёнке.")
-    return ConversationHandler.END
-
-
-async def handle_shoot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Напиши кратко: где и во сколько съёмка?")
-    return STATE_SHOOT_DETAILS
-
-
-async def shoot_details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    details = update.message.text.strip()
-    await save_status(update, "Съёмка", details)
-    await update.message.reply_text("Отметил — вы на съёмке.")
-    return ConversationHandler.END
-
-
-async def handle_vacation(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Напиши даты отпуска (например: 15.07 — 25.07):")
-    return STATE_VACATION_DATES
-
-
-async def vacation_dates_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    dates = update.message.text.strip()
-    await save_status(update, "Отпуск", dates)
-    await update.message.reply_text("Хорошего отдыха! Отметил.")
-    return ConversationHandler.END
-
-
-async def save_status(update: Update, status: str, note: str):
+async def save_status(update, status, detail_key="", detail_value=""):
     creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPE)
     client = gspread.authorize(creds)
-    status_ws = client.open_by_key(SPREADSHEET_ID).worksheet(STATUS_SHEET)
     emp_ws = client.open_by_key(SPREADSHEET_ID).worksheet(EMPLOYEE_SHEET)
+    stat_ws = client.open_by_key(SPREADSHEET_ID).worksheet(STATUS_SHEET)
+    user_id = str(update.effective_user.id)
+    name = next((r["Имя"] for r in emp_ws.get_all_records() if str(r["Telegram ID"]) == user_id), None)
+    if name:
+        today = date.today().strftime("%d.%m.%Y")
+        row = [today, name, status, "", ""]
+        if detail_key == "Причина":
+            row[3] = detail_value
+        elif detail_key == "Время":
+            row[4] = detail_value
+        stat_ws.append_row(row)
+    await update.message.reply_text("Статус сохранён. Хорошего дня!")
 
-    rows = emp_ws.get_all_records()
-    user_id = str(update.effective_user.id).strip()
-    name = next((r["Имя"] for r in rows if str(r.get("Telegram ID", "")).strip() == user_id), "Неизвестный")
+async def handle_office(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await save_status(update, "Офис", "Время", "с 10:00")
+    return ConversationHandler.END
 
-    today = date.today().strftime("%d.%m.%Y")
-    status_ws.append_row([today, name, status, note])
+async def handle_remote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Причина удалёнки?")
+    return STATE_REMOTE_REASON
 
+async def remote_reason_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await save_status(update, "Удалённо", "Причина", update.message.text.strip())
+    return ConversationHandler.END
+
+async def handle_shoot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Где съёмка?")
+    return STATE_SHOOT_DETAILS
+
+async def shoot_details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await save_status(update, "Съёмка", "Причина", update.message.text.strip())
+    return ConversationHandler.END
+
+async def handle_vacation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Сколько дней?")
+    return STATE_VACATION_DATES
+
+async def vacation_dates_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await save_status(update, "Отпуск", "Причина", update.message.text.strip())
+    return ConversationHandler.END
+
+async def handle_dayoff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await save_status(update, "Dayoff")
+    return ConversationHandler.END
 
 async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPE)
-    client = gspread.authorize(creds)
-    status_ws = client.open_by_key(SPREADSHEET_ID).worksheet(STATUS_SHEET)
-
+    stat_ws = gspread.authorize(creds).open_by_key(SPREADSHEET_ID).worksheet(STATUS_SHEET)
     today = date.today().strftime("%d.%m.%Y")
-    records = status_ws.get_all_records()
-    lines = [r for r in records if r["Дата"] == today]
-    text = "Список сотрудников сегодня:\n\n"
-    for i, r in enumerate(lines, 1):
-        note = r.get("Причина", "") or r.get("Время", "") or ""
-        text += f"{i}. {r['Имя']} — {r['Статус']} ({note})\n"
-    await update.message.reply_text(text)
+    lines = [r for r in stat_ws.get_all_records() if r["Дата"] == today]
+    text = "Список сотрудников сегодня:
+
+" + "
+".join(
+        f"{i+1}. {r['Имя']} — {r['Статус']} ({r['Причина'] or r['Время']})" for i, r in enumerate(lines)
+    )
+    await update.message.reply_text(text or "Сегодня ещё никто не отметился.")
     return ConversationHandler.END
 
-
-async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
-    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPE)
-    client = gspread.authorize(creds)
-    emp_ws = client.open_by_key(SPREADSHEET_ID).worksheet(EMPLOYEE_SHEET)
-    rows = emp_ws.get_all_records()
-
-    for r in rows:
-        try:
-            uid = int(r["Telegram ID"])
-            await context.bot.send_message(chat_id=uid, text="Доброе утро! Не забудь отметить свой статус на сегодня 😉", reply_markup=main_menu)
-        except Exception as e:
-            logger.error(f"Не смог отправить сообщение {r}: {e}")
-
-
-def build_application():
-    return ApplicationBuilder().token(TOKEN).build()
-
-
 def main():
-    app = build_application()
+    app = ApplicationBuilder().token(TOKEN).build()
 
-    conv = ConversationHandler(
+    conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             STATE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, name_handler)],
@@ -180,6 +122,7 @@ def main():
                 MessageHandler(filters.Regex("^🏠 Удалённо$"), handle_remote),
                 MessageHandler(filters.Regex("^🎨 На съёмках$"), handle_shoot),
                 MessageHandler(filters.Regex("^🌴 В отпуске$"), handle_vacation),
+                MessageHandler(filters.Regex("^🚫 Dayoff$"), handle_dayoff),
                 MessageHandler(filters.Regex("^📋 Список сотрудников$"), show_list),
             ],
             STATE_REMOTE_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, remote_reason_handler)],
@@ -188,13 +131,9 @@ def main():
         },
         fallbacks=[CommandHandler("start", start)],
     )
-    app.add_handler(conv)
 
-    remind_time = time(hour=9, minute=30)
-    app.job_queue.run_daily(send_reminder, remind_time, days=(0, 1, 2, 3, 4))
-
+    app.add_handler(conv_handler)
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
