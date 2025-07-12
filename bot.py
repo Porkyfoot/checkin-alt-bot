@@ -1,107 +1,138 @@
-import os
+# bot.py
 import logging
-from datetime import datetime, time, timedelta
+from datetime import time, date
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import ReplyKeyboardMarkup, KeyboardButton, Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ConversationHandler, ContextTypes, filters, CallbackContext
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
 )
 
-# --- CONFIG ---
-TOKEN = os.environ['TOKEN']
-SPREADSHEET_NAME = 'Ежедневные Отметки'
-TIMEZONE_OFFSET = 5  # часовой пояс
+# --- константы состояний разговора ---
+(
+    STATE_NAME,
+    STATE_STATUS,
+    STATE_REMOTE_REASON,
+    STATE_SHOOT_DETAILS,
+    STATE_VACATION_DATES,
+) = range(5)
 
-# --- Google Sheets Setup ---
-scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-creds = ServiceAccountCredentials.from_json_keyfile_name('/etc/secrets/credentials.json', scope)
-client = gspread.authorize(creds)
-sheet = client.open(SPREADSHEET_NAME).sheet1
+# Google-сборы
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+CREDS_FILE = "/etc/secrets/credentials.json"
+SPREADSHEET_ID = "ваш-ID-таблицы"
+EMPLOYEE_SHEET = "Employees"
+STATUS_SHEET = "Status"
 
-# --- States ---
-ASK_NAME, CHOOSING, DETAILS = range(3)
+# Telegram
+TOKEN = "ваш-токен"
+
+# Keyboard
+main_menu = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("🏢 Уже в офисе"), KeyboardButton("🏠 Удалённо")],
+        [KeyboardButton("🎨 На съёмках"),    KeyboardButton("🌴 В отпуске")],
+        [KeyboardButton("📋 Список сотрудников")],
+    ],
+    resize_keyboard=True,
+)
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def today_str():
-    return (datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)).strftime('%d.%m.%Y')
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    headers = sheet.row_values(1)
-    if headers != ['Дата','Имя','ID','Статус','Детали']:
-        sheet.clear()
-        sheet.append_row(['Дата','Имя','ID','Статус','Детали'])
-    await update.message.reply_text('Привет! Напиши своё ФИО на русском.')
-    return ASK_NAME
+    # Привязка к Google
+    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPE)
+    client = gspread.authorize(creds)
+    emp_ws = client.open_by_key(SPREADSHEET_ID).worksheet(EMPLOYEE_SHEET)
+    # если юзер новый — спросим имя
+    rows = emp_ws.get_all_records()
+    ids = [str(r["Telegram ID"]) for r in rows]
+    if str(update.effective_user.id) not in ids:
+        await update.message.reply_text("Пожалуйста, представьтесь: Фамилия Имя (русскими буквами).")
+        return STATE_NAME
 
-async def ask_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['name'] = update.message.text.strip()
-    kb = [['🏢 Уже в офисе'], ['🏠 Удалённо','🎨 На съёмках'], ['🌴 В отпуске'], ['📋 Список']]
-    markup = ReplyKeyboardMarkup(kb, resize_keyboard=True)
-    await update.message.reply_text('Выбери статус:', reply_markup=markup)
-    return CHOOSING
+    await update.message.reply_text(
+        "Выбери статус на сегодня:", 
+        reply_markup=main_menu
+    )
+    return STATE_STATUS
 
-async def status_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    status = update.message.text
-    uid = update.effective_user.id
-    if status == '📋 Список':
-        return await show_list(update, context)
-    context.user_data['status'] = status
-    if status == '🏢 Уже в офисе':
-        context.user_data['details'] = (datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)).strftime('%H:%M')
-        return await save(update, context)
-    await update.message.reply_text('Напиши детали или "нет".', reply_markup=ReplyKeyboardRemove())
-    return DETAILS
 
-async def details(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['details'] = update.message.text.strip()
-    return await save(update, context)
+async def name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPE)
+    client = gspread.authorize(creds)
+    emp_ws = client.open_by_key(SPREADSHEET_ID).worksheet(EMPLOYEE_SHEET)
 
-async def save(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    u = update.effective_user
-    data = context.user_data
-    row = [today_str(), data['name'], str(u.id), data['status'], data.get('details','')]
-    sheet.append_row(row)
-    await update.message.reply_text('✅ Записано!', reply_markup=ReplyKeyboardRemove())
-    return ConversationHandler.END
+    fullname = update.message.text.strip()
+    emp_ws.append_row([fullname, str(update.effective_user.id)])
+    await update.message.reply_text("Записал. Теперь выбери статус:", reply_markup=main_menu)
+    return STATE_STATUS
+
+
+# ——— Тут ваши хендлеры на каждый статус (удалёнка, съёмки, отпуск) ———
+# каждый хендлер в конце делает STATE = ConversationHandler.END
+
 
 async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    recs = sheet.get_all_records()
-    t = today_str()
-    lines = []
-    i = 1
-    for r in recs:
-        if r['Дата'] == t:
-            lines.append(f"{i}. {r['Имя']} — {r['Статус']} ({r['Детали']})")
-            i += 1
-    text = 'Список сегодня:\n' + '\n'.join(lines) if lines else 'Никто не отметил.'
-    await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPE)
+    client = gspread.authorize(creds)
+    status_ws = client.open_by_key(SPREADSHEET_ID).worksheet(STATUS_SHEET)
 
-def reminder(context: CallbackContext):
-    recs = sheet.get_all_records()
-    t = today_str()
-    ids = {r['ID'] for r in recs if r['Дата']==t}
-    for uid in ids:
-        context.bot.send_message(chat_id=int(uid), text='Пожалуйста, отметь свой статус до 10:00. /start')
+    today = date.today().strftime("%d.%m.%Y")
+    records = status_ws.get_all_records()
+    lines = [r for r in records if r["Дата"] == today]
+    text = "Список сотрудников сегодня:\n\n"
+    for i, r in enumerate(lines, 1):
+        text += (
+            f"{i}. {r['Имя']} — {r['Статус']} "
+            f"({r['Причина'] or r['Время']})\n"
+        )
+    await update.message.reply_text(text)
+    return ConversationHandler.END
+
+
+def build_application():
+    return (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .build()
+    )
+
 
 def main():
-    app = ApplicationBuilder().token(TOKEN).build()
+    app = build_application()
+
+    # ConversationHandler
     conv = ConversationHandler(
-        entry_points=[CommandHandler('start', start)],
+        entry_points=[CommandHandler("start", start)],
         states={
-            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_status)],
-            CHOOSING: [MessageHandler(filters.TEXT & ~filters.COMMAND, status_chosen)],
-            DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, details)]
+            STATE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, name_handler)],
+            STATE_STATUS: [
+                MessageHandler(filters.Regex("^🏢 Уже в офисе$"),      handle_office),
+                MessageHandler(filters.Regex("^🏠 Удалённо$"),        handle_remote),
+                MessageHandler(filters.Regex("^🎨 На съёмках$"),      handle_shoot),
+                MessageHandler(filters.Regex("^🌴 В отпуске$"),       handle_vacation),
+                MessageHandler(filters.Regex("^📋 Список сотрудников$"), show_list),
+            ],
+            # и далее переходы для других состояний...
         },
-        fallbacks=[CommandHandler('cancel', lambda u,c: c.bot.send_message(u.effective_chat.id,'Отменено'))]
+        fallbacks=[CommandHandler("start", start)],
     )
     app.add_handler(conv)
-    # ежедневно в 9:30 (UTC = 9:30 - TIMEZONE_OFFSET)
-    remind_time = time(hour=9-TIMEZONE_OFFSET, minute=30)
-    app.job_queue.run_daily(reminder, remind_time, days=(0,1,2,3,4))
+
+    # Ежедневное напоминание
+    remind_time = time(hour=9, minute=30)
+    app.job_queue.run_daily(send_reminder, remind_time, days=(0,1,2,3,4))
+
     app.run_polling()
 
-if __name__=='__main__':
+
+if __name__ == "__main__":
     main()
