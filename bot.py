@@ -68,7 +68,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         today = get_today_date()
         all_att = att_sheet.get_all_records()
         if any(str(chat_id) == str(r['Telegram ID']) and r['Дата'] == today for r in all_att):
-            await update.message.reply_text("⚠️ Вы уже отметили статус сегодня.")
+            keyboard = [['📋 Список сотрудников']]
+            await update.message.reply_text("⚠️ Вы уже отметили статус сегодня.", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
             return ConversationHandler.END
 
         keyboard = [
@@ -142,7 +143,7 @@ async def received_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_data[chat_id]['status'] == '⏰ Задерживаюсь':
         await update.message.reply_text("По какой причине вы задерживаетесь?")
     else:
-        await update.message.reply_text("Укажите причину (или «нет»)") 
+        await update.message.reply_text("Укажите причину (или «нет»)" )
     return TYPING_REASON
 
 async def received_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -169,10 +170,12 @@ async def save_and_finish(update: Update, time_str: str = None) -> int:
     ]
     att_sheet.append_row(row)
 
+    keyboard = [['📋 Список сотрудников']]
     await update.message.reply_text(
         "✅ Записано. Хорошего дня!",
-        reply_markup=ReplyKeyboardRemove()
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
+
     return ConversationHandler.END
 
 async def send_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -197,18 +200,20 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     today = get_today_date()
-    done = {
-        r['Telegram ID']
-        for r in att_sheet.get_all_records()
+    all_records = att_sheet.get_all_records()
+    done_today = {
+        r['Telegram ID']: r['Статус']
+        for r in all_records
         if r['Дата'] == today
     }
     emps = emp_sheet.get_all_records()
     for r in emps:
         tid = str(r['Telegram ID'])
-        if tid not in done:
+        status = done_today.get(tid)
+        if not status or status not in ('🏢 Уже в офисе', '🌴 В отпуске', '🛌 Dayoff'):
             await context.bot.send_message(
                 chat_id=int(tid),
-                text="⏰ Пожалуйста, отметьте свой статус на сегодня!"
+                text="⏰ Не забудь указать свой статус, рабочий день начинается с 10:00."
             )
 
 def main():
