@@ -1,223 +1,213 @@
-#!/usr/bin/env python3
 import os
-import logging
-from datetime import datetime
+from datetime import datetime, time
+from telegram import (
+    __version__ as ptb_ver, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
+)
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, ContextTypes,
+    MessageHandler, ConversationHandler, filters
+)
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.ext import (
-    ApplicationBuilder, ContextTypes,
-    ConversationHandler, CommandHandler, MessageHandler, filters
-)
 
-# Логирование
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# ------------------ КОНФИГ ------------------
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "ваш-ID-таблицы")
+TOKEN          = os.getenv("TOKEN",          "ваш-бот-токен")
+SECRET_JSON    = os.getenv("SECRET_JSON",    "/etc/secrets/credentials.json")
 
-# Google Sheets авторизация
-scope = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive",
-]
-creds = ServiceAccountCredentials.from_json_keyfile_name(
-    '/etc/secrets/credentials.json', scope
-)
-gc = gspread.authorize(creds)
+# Названия листов
+EMP_SHEET    = "Employees"
+DATA_SHEET   = "Daily"   # где хранятся метки
 
-# Настройки таблицы
-SPREADSHEET = os.getenv("SPREADSHEET_NAME", "MyStatusBot")
-EMP_SHEET = os.getenv("EMP_SHEET_NAME", "Employees")
-STATUS_SHEET = os.getenv("STATUS_SHEET_NAME", "Statuses")
-
-employees_ws = gc.open(SPREADSHEET).worksheet(EMP_SHEET)
-status_ws = gc.open(SPREADSHEET).worksheet(STATUS_SHEET)
-
-# Состояния беседы
+# Константы состояний ConversationHandler
 (
-    ASK_NAME,
+    REG_NAME,
     CHOOSING,
-    ASK_LATE_TIME,
-    ASK_LATE_REASON,
-    ASK_REMOTE_REASON,
-    ASK_VACATION_DATES,
-    ASK_SHOOTING_DETAILS,
+    LATE_TIME, LATE_REASON,
+    VAC_DATES,
+    SHOOT_DETAIL,
+    REMOTE_REASON
 ) = range(7)
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    uid = update.effective_user.id
-    records = employees_ws.get_all_records()
-    # Если нет в списке — спрашиваем имя
-    if not any(str(r.get("Telegram ID")) == str(uid) for r in records):
-        await update.message.reply_text(
-            "Привет! Как вас зовут?",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return ASK_NAME
-    # Иначе сразу меню статусов
-    return await ask_status(update, context)
+# ------------------ GOOGLE SHEETS ------------------
+scope = ["https://spreadsheets.google.com/feeds",
+         "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_name(SECRET_JSON, scope)
+gc    = gspread.authorize(creds)
 
-async def ask_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    keyboard = [
-        ["⏰ Задерживаюсь", "🏢 Удаленно"],
-        ["🌴 В отпуске", "🎨 На съёмках", "🛌 DayOff"],
-    ]
+emp_ws  = gc.open_by_key(SPREADSHEET_ID).worksheet(EMP_SHEET)
+data_ws = gc.open_by_key(SPREADSHEET_ID).worksheet(DATA_SHEET)
+
+# ------------------ КЛАВИАТУРЫ ------------------
+MAIN_KEYS = [
+    ["⏰ Задерживаюсь", "🛌 DayOff"],
+    ["🌴 В отпуске",    "🎨 На съёмках"],
+    ["💻 Удалённо"]
+]
+main_kb = ReplyKeyboardMarkup(MAIN_KEYS, one_time_keyboard=True, resize_keyboard=True)
+
+# ------------------ ХЕЛПЕРЫ ------------------
+def append_row(name, tid, status, details="", reason=""):
+    """Записать в DATA_SHEET новую строку."""
+    today = datetime.now().strftime("%d.%m.%Y")
+    data_ws.append_row([today, name, str(tid), status, details, reason])
+
+async def show_menu(update, context):
     await update.message.reply_text(
-        "Выбери статус:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, one_time_keyboard=True)
+        "Выберите статус:",
+        reply_markup=main_kb
     )
     return CHOOSING
 
-async def save_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    name = update.message.text.strip()
-    uid = update.effective_user.id
-    date = datetime.now().strftime("%d.%m.%Y")
-    # Сохраняем в Employees (Date, Name, Telegram ID)
-    employees_ws.append_row([date, name, uid])
-    await update.message.reply_text(f"Спасибо, {name}! Теперь выберите статус.")
-    return await ask_status(update, context)
+# ------------------ ОБРАБОТЧИКИ ------------------
+async def start(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user.id)
+    # проверяем, есть ли уже в Employees
+    records = emp_ws.get_all_records()
+    for r in records:
+        if str(r.get("Telegram ID")) == user_id:
+            context.user_data["name"] = r["Name"]
+            return await show_menu(update, context)
 
-async def handle_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    choice = update.message.text
-    context.user_data['status'] = choice
-    # Обработка каждого варианта
-    if choice == "⏰ Задерживаюсь":
-        await update.message.reply_text(
-            "Во сколько планируешь быть в офисе?",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return ASK_LATE_TIME
-    if choice == "🏢 Удаленно":
-        await update.message.reply_text(
-            "По какой причине работаешь удаленно?",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return ASK_REMOTE_REASON
-    if choice == "🌴 В отпуске":
-        await update.message.reply_text(
-            "Укажи даты отпуска (например: с 07.09 до 12.09)",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return ASK_VACATION_DATES
-    if choice == "🎨 На съёмках":
-        await update.message.reply_text(
-            "Что за съёмки? (клиент/детали)",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return ASK_SHOOTING_DETAILS
-    if choice == "🛌 DayOff":
-        # Сразу записываем и выходим
-        await record_status(update, context, details="", reason="")
-        return ConversationHandler.END
-    # Если непонятно — заново
-    await update.message.reply_text("Пожалуйста, выбери статус из меню.")
-    return CHOOSING
-
-async def late_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data['late_time'] = update.message.text.strip()
-    await update.message.reply_text("Почему задерживаешься?")
-    return ASK_LATE_REASON
-
-async def late_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    reason = update.message.text.strip()
-    details = context.user_data.get('late_time', '')
-    await record_status(update, context, details=details, reason=reason)
-    return ConversationHandler.END
-
-async def remote_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    reason = update.message.text.strip()
-    await record_status(update, context, details="", reason=reason)
-    return ConversationHandler.END
-
-async def vacation_dates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    details = update.message.text.strip()
-    await record_status(update, context, details=details, reason="")
-    return ConversationHandler.END
-
-async def shooting_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    details = update.message.text.strip()
-    await record_status(update, context, details=details, reason="")
-    return ConversationHandler.END
-
-async def record_status(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    details: str,
-    reason: str
-) -> None:
-    user = update.effective_user
-    uid = user.id
-    # Ищем имя в Employees
-    name = None
-    for r in employees_ws.get_all_records():
-        if str(r.get("Telegram ID")) == str(uid):
-            name = r.get("Name")
-            break
-    if not name:
-        name = user.full_name
-    status = context.user_data['status']
-    date = datetime.now().strftime("%d.%m.%Y")
-    # Запись в таблицу Statuses (Date, Name, Telegram ID, Status, Details, Reason)
-    status_ws.append_row([date, name, uid, status, details, reason])
+    # если нет — регистрируем
     await update.message.reply_text(
-        "Ваш статус сохранен!",
+        "Привет! Я бот для ежедневных отметок.\n"
+        "Пожалуйста, представьтесь (Имя и фамилия):",
         reply_markup=ReplyKeyboardRemove()
     )
+    return REG_NAME
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text(
-        "Отменено.", reply_markup=ReplyKeyboardRemove()
-    )
+async def reg_name(update, context):
+    name = update.message.text.strip()
+    tid  = update.message.from_user.id
+    # сохраняем в Employees
+    emp_ws.append_row([name, str(tid)])
+    context.user_data["name"] = name
+    await update.message.reply_text(f"Приятно познакомиться, {name}!\n")
+    return await show_menu(update, context)
+
+# выбор статуса
+async def choose(update, context):
+    text   = update.message.text
+    context.user_data["status"] = text
+
+    if text == "⏰ Задерживаюсь":
+        await update.message.reply_text("Во сколько будете в офисе? (например 09:30)",
+                                        reply_markup=ReplyKeyboardRemove())
+        return LATE_TIME
+
+    if text == "🛌 DayOff":
+        append_row(context.user_data["name"], update.message.from_user.id,
+                   text)
+        await update.message.reply_text("Отметка DayOff сохранена.",
+                                        reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    if text == "🌴 В отпуске":
+        await update.message.reply_text(
+            "Укажите даты отпуска в формате DD.MM–DD.MM (например 07.09–12.09):",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return VAC_DATES
+
+    if text == "🎨 На съёмках":
+        await update.message.reply_text(
+            "За кого/какой проект вы на съёмках?",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return SHOOT_DETAIL
+
+    if text == "💻 Удалённо":
+        await update.message.reply_text(
+            "По какой причине работаете удалённо?",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return REMOTE_REASON
+
+    # на всякий случай
     return ConversationHandler.END
 
-# /today — вывод статусов за сегодня
-async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    date = datetime.now().strftime("%d.%m.%Y")
-    recs = status_ws.get_all_records()
+# ⏰ Задерживаюсь → время → причина
+async def late_time(update, context):
+    context.user_data["late_time"] = update.message.text.strip()
+    await update.message.reply_text("Причина опоздания?")
+    return LATE_REASON
+
+async def late_reason(update, context):
+    time_   = context.user_data.pop("late_time")
+    reason  = update.message.text.strip()
+    append_row(context.user_data["name"], update.message.from_user.id,
+               "⏰ Задерживаюсь", details=time_, reason=reason)
+    await update.message.reply_text("Отметка опоздания сохранена.")
+    return ConversationHandler.END
+
+# 🌴 В отпуске → даты
+async def vac_dates(update, context):
+    dates = update.message.text.strip()
+    append_row(context.user_data["name"], update.message.from_user.id,
+               "🌴 В отпуске", details=dates)
+    await update.message.reply_text("Даты отпуска сохранены.")
+    return ConversationHandler.END
+
+# 🎨 На съёмках → детали
+async def shoot_detail(update, context):
+    detail = update.message.text.strip()
+    append_row(context.user_data["name"], update.message.from_user.id,
+               "🎨 На съёмках", details=detail)
+    await update.message.reply_text("Детали съёмки сохранены.")
+    return ConversationHandler.END
+
+# 💻 Удалённо → причина
+async def remote_reason(update, context):
+    reason = update.message.text.strip()
+    append_row(context.user_data["name"], update.message.from_user.id,
+               "💻 Удалённо", reason=reason)
+    await update.message.reply_text("Отметка удалёнки сохранена.")
+    return ConversationHandler.END
+
+async def cancel(update, context):
+    await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+# /list — вывод всех отметок за сегодня
+async def list_today(update, context):
+    today = datetime.now().strftime("%d.%m.%Y")
+    rows  = data_ws.get_all_records()
     lines = []
-    i = 1
-    for r in recs:
-        if r.get("Date") == date:
-            name = r.get("Name")
-            st = r.get("Status")
-            det = r.get("Details", "")
-            rea = r.get("Reason", "")
-            note = ""
-            if st == "⏰ Задерживаюсь":
-                note = f"({det}, {rea})"
-            elif st == "🏢 Удаленно":
-                note = f"({rea})"
-            elif st == "🌴 В отпуске":
-                note = f"({det})"
-            elif st == "🎨 На съёмках":
-                note = f"({det})"
-            lines.append(f"{i}. {name} — {st} {note}")
-            i += 1
-    text = ("Список сотрудников сегодня:\n" + "\n".join(lines)) if lines else "Записей на сегодня нет."
+    for r in rows:
+        if r["Дата"] == today:
+            # собираем строку: ФИО — Статус (детали, причина)
+            parts = [f"{r['Имя']} — {r['Статус']}"]
+            if r.get("Детали"):
+                parts.append(f"({r['Детали']})")
+            if r.get("Причина"):
+                parts.append(f"«{r['Причина']}»")
+            lines.append(" ".join(parts))
+    text = "Список сотрудников сегодня:\n" + "\n".join(f"{i+1}. {l}" for i,l in enumerate(lines))
     await update.message.reply_text(text)
 
-
-def main() -> None:
-    token = os.getenv("BOT_TOKEN")
-    app = ApplicationBuilder().token(token).build()
+# ------------------ MAIN ------------------
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_name)],
-            CHOOSING: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_choice)],
-            ASK_LATE_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, late_time)],
-            ASK_LATE_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, late_reason)],
-            ASK_REMOTE_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, remote_reason)],
-            ASK_VACATION_DATES: [MessageHandler(filters.TEXT & ~filters.COMMAND, vacation_dates)],
-            ASK_SHOOTING_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, shooting_details)],
+            REG_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, reg_name)],
+            CHOOSING:     [MessageHandler(filters.Regex("|".join(
+                                [k for row in MAIN_KEYS for k in row])), choose)],
+            LATE_TIME:    [MessageHandler(filters.TEXT & ~filters.COMMAND, late_time)],
+            LATE_REASON:  [MessageHandler(filters.TEXT & ~filters.COMMAND, late_reason)],
+            VAC_DATES:    [MessageHandler(filters.TEXT & ~filters.COMMAND, vac_dates)],
+            SHOOT_DETAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, shoot_detail)],
+            REMOTE_REASON:[MessageHandler(filters.TEXT & ~filters.COMMAND, remote_reason)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        per_user=True
     )
 
     app.add_handler(conv)
-    app.add_handler(CommandHandler("today", today))
+    app.add_handler(CommandHandler("list", list_today))
 
     app.run_polling()
 
