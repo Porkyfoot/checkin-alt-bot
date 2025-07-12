@@ -40,6 +40,9 @@ logging.basicConfig(
 def get_today_date() -> str:
     return (datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)).strftime('%d.%m.%Y')
 
+def get_current_time() -> str:
+    return (datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)).strftime('%H:%M')
+
 def get_date_range_list(date_range_str: str) -> list:
     try:
         start_str, end_str = date_range_str.replace('–', '-').split('-')
@@ -69,7 +72,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     all_att = att_sheet.get_all_records()
     today = get_today_date()
-    if any(str(chat_id) == str(r.get('Telegram ID')) and r.get('Дата') == today for r in all_att):
+    if any(str(chat_id) == str(r.get('ID')) and r.get('Дата') == today for r in all_att):
         await update.message.reply_text(
             "Вы уже отметились сегодня. 📋 Список сотрудников доступен ниже.",
             reply_markup=ReplyKeyboardMarkup([['📋 Список сотрудников']], resize_keyboard=True)
@@ -119,7 +122,7 @@ async def status_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await send_overview(update, context)
 
     if status == '🏢 Уже в офисе':
-        return await save_and_finish(update, time_str=get_today_date())
+        return await save_and_finish(update, time_str=get_current_time())
 
     if status in ('🌴 В отпуске', '🤒 На больничном'):
         await update.message.reply_text("Укажите диапазон дат (например: 01.07–09.07):")
@@ -190,7 +193,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     today = get_today_date()
     done = {
-        r.get('Telegram ID')
+        r.get('ID')
         for r in att_sheet.get_all_records()
         if r.get('Дата') == today and r.get('Статус') in ('🏢 Уже в офисе', '🌴 В отпуске', '🛌 Dayoff', '🤒 На больничном')
     }
