@@ -19,6 +19,8 @@ from telegram.ext import (
     filters,
 )
 
+import re
+
 # === КОНФИГ ===
 TOKEN = os.environ['TOKEN']
 SPREADSHEET_NAME = 'checkin-alt-bot'
@@ -57,6 +59,16 @@ def is_registered(chat_id: int) -> bool:
     records = emp_sheet.get_all_records()
     return any(str(chat_id) == str(r.get('Telegram ID')) for r in records)
 
+def parse_date_range(text):
+    match = re.match(r"(\d{2})\.(\d{2})\s*[–-]\s*(\d{2})\.(\d{2})", text)
+    if not match:
+        return []
+    d1, m1, d2, m2 = map(int, match.groups())
+    year = datetime.utcnow().year
+    start = datetime(year, m1, d1)
+    end = datetime(year, m2, d2)
+    return [(start + timedelta(days=i)).strftime('%d.%m.%Y') for i in range((end - start).days + 1)]
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
 
@@ -76,6 +88,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ['🏢 Уже в офисе', '⏰ Задерживаюсь'],
             ['🏠 Удалённо', '🎨 На съёмках'],
             ['🌴 В отпуске', '🛌 Dayoff'],
+            ['🤒 На больничном'],
             ['📋 Список сотрудников']
         ]
         await update.message.reply_text(
@@ -105,6 +118,7 @@ async def new_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ['🏢 Уже в офисе', '⏰ Задерживаюсь'],
         ['🏠 Удалённо', '🎨 На съёмках'],
         ['🌴 В отпуске', '🛌 Dayoff'],
+        ['🤒 На больничном'],
         ['📋 Список сотрудников']
     ]
     await update.message.reply_text(
@@ -124,8 +138,8 @@ async def status_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if status == '🏢 Уже в офисе':
         return await save_and_finish(update, time_str=get_today_date())
 
-    if status == '🌴 В отпуске':
-        await update.message.reply_text("Укажите диапазон дат отпуска (например: 01.07–09.07):")
+    if status in ('🌴 В отпуске', '🤒 На больничном'):
+        await update.message.reply_text("Укажите диапазон дат (например: 01.07–09.07):")
         return TYPING_REASON
 
     if status == '⏰ Задерживаюсь':
@@ -148,7 +162,30 @@ async def received_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def received_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
-    user_data[chat_id]['reason'] = update.message.text.strip()
+    reason_text = update.message.text.strip()
+    user_data[chat_id]['reason'] = reason_text
+
+    status = user_data[chat_id]['status']
+    if status in ('🌴 В отпуске', '🤒 На больничном'):
+        dates = parse_date_range(reason_text)
+        for date in dates:
+            row = [
+                date,
+                user_data[chat_id]['name'],
+                str(chat_id),
+                status,
+                '',
+                reason_text,
+                ''
+            ]
+            att_sheet.append_row(row)
+        keyboard = [['📋 Список сотрудников']]
+        await update.message.reply_text(
+            f"✅ Статус '{status}' записан на даты: {reason_text}.",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        )
+        return ConversationHandler.END
+
     return await save_and_finish(update)
 
 async def save_and_finish(update: Update, time_str: str = None) -> int:
@@ -210,7 +247,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     for r in emps:
         tid = str(r['Telegram ID'])
         status = done_today.get(tid)
-        if not status or status not in ('🏢 Уже в офисе', '🌴 В отпуске', '🛌 Dayoff'):
+        if not status or status not in ('🏢 Уже в офисе', '🌴 В отпуске', '🛌 Dayoff', '🤒 На больничном'):
             await context.bot.send_message(
                 chat_id=int(tid),
                 text="⏰ Не забудь указать свой статус, рабочий день начинается с 10:00."
@@ -231,6 +268,9 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv)
+
+    # Глобальный хендлер кнопки "Список сотрудников"
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📋 Список сотрудников$"), send_overview))
 
     jq = app.job_queue
     jq.run_daily(send_reminder, dt_time(hour=9, minute=30), days=(0,1,2,3,4))
