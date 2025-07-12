@@ -1,0 +1,11 @@
+services:
+  - type: worker
+    name: telegram-checkin-bot
+    env: python
+    startCommand: python bot.py
+    secretFiles:
+      - name: credentials.json
+        mountPath: /etc/secrets/credentials.json
+    envVars:
+      - key: TOKEN
+        sync: false
