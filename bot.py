@@ -38,15 +38,14 @@ emp_sheet = client.open(SPREADSHEET_NAME).worksheet('Employees')
 
 # === Состояния ConversationHandler ===
 (
-    NEW_USER,        # вводим ФИО
-    CHOOSING_STATUS, # выбираем пункт меню
-    TYPING_TIME,     # ввод времени
-    TYPING_REASON    # ввод причины
+    NEW_USER,
+    CHOOSING_STATUS,
+    TYPING_TIME,
+    TYPING_REASON
 ) = range(4)
 
-user_data = {}  # временные данные по пользователю
+user_data = {}
 
-# === Логирование ===
 logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO
 )
@@ -54,8 +53,36 @@ logging.basicConfig(
 def get_today_date() -> str:
     return (datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)).strftime('%d.%m.%Y')
 
-# --- Шаг 1: зарегистрировать нового пользователя ---
+def is_registered(chat_id: int) -> bool:
+    records = emp_sheet.get_all_records()
+    return any(str(chat_id) == str(r.get('Telegram ID')) for r in records)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+
+    if is_registered(chat_id):
+        records = emp_sheet.get_all_records()
+        user = next(r for r in records if str(r.get('Telegram ID')) == str(chat_id))
+        user_data[chat_id] = {'name': user['Имя']}
+
+        today = get_today_date()
+        all_att = att_sheet.get_all_records()
+        if any(str(chat_id) == str(r['Telegram ID']) and r['Дата'] == today for r in all_att):
+            await update.message.reply_text("⚠️ Вы уже отметили статус сегодня.")
+            return ConversationHandler.END
+
+        keyboard = [
+            ['🏢 Уже в офисе', '⏰ Задерживаюсь'],
+            ['🏠 Удалённо', '🎨 На съёмках'],
+            ['🌴 В отпуске', '🛌 Dayoff'],
+            ['📋 Список сотрудников']
+        ]
+        await update.message.reply_text(
+            f"Добро пожаловать снова, {user['Имя']}!\nВыберите статус на сегодня:",
+            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        )
+        return CHOOSING_STATUS
+
     await update.message.reply_text(
         "Добро пожаловать! Пожалуйста, представьтесь:\nВведите Фамилию и Имя (на русском):",
         reply_markup=ReplyKeyboardRemove()
@@ -66,15 +93,17 @@ async def new_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     chat_id = update.message.chat_id
 
-    # сохраняем ФИО и telegram_id
+    if is_registered(chat_id):
+        await update.message.reply_text("⚠️ Вы уже зарегистрированы.")
+        return ConversationHandler.END
+
     emp_sheet.append_row([text, chat_id])
     user_data[chat_id] = {'name': text}
 
-    # показываем главное меню
     keyboard = [
-        ['🏢 Уже в офисе'],
+        ['🏢 Уже в офисе', '⏰ Задерживаюсь'],
         ['🏠 Удалённо', '🎨 На съёмках'],
-        ['🌴 В отпуске'],
+        ['🌴 В отпуске', '🛌 Dayoff'],
         ['📋 Список сотрудников']
     ]
     await update.message.reply_text(
@@ -83,7 +112,6 @@ async def new_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return CHOOSING_STATUS
 
-# --- Шаг 2: пользователь выбирает статус ---
 async def status_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = update.message.text
     chat_id = update.message.chat_id
@@ -93,41 +121,40 @@ async def status_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await send_overview(update, context)
 
     if status == '🏢 Уже в офисе':
-        # сразу фиксируем время
         return await save_and_finish(update, time_str=get_today_date())
 
     if status == '🌴 В отпуске':
         await update.message.reply_text("Укажите диапазон дат отпуска (например: 01.07–09.07):")
         return TYPING_REASON
 
-    # для остальных — спрашиваем время/причину
+    if status == '⏰ Задерживаюсь':
+        await update.message.reply_text("Во сколько вы будете в офисе?")
+        return TYPING_TIME
+
     prompt = "Во сколько вы на связи или в офисе?" if status in ('🎨 На съёмках', '🏠 Удалённо') else ""
     await update.message.reply_text(prompt)
     return TYPING_TIME
 
-# ввод времени прибытия
 async def received_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     user_data[chat_id]['time'] = update.message.text.strip()
-    await update.message.reply_text("Укажите причину (или «нет»)") 
+
+    if user_data[chat_id]['status'] == '⏰ Задерживаюсь':
+        await update.message.reply_text("По какой причине вы задерживаетесь?")
+    else:
+        await update.message.reply_text("Укажите причину (или «нет»)") 
     return TYPING_REASON
 
-# ввод причины или диапазона отпуска
 async def received_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     user_data[chat_id]['reason'] = update.message.text.strip()
     return await save_and_finish(update)
 
-# сохраняем запись и завершаем разговор
-async def save_and_finish(
-    update: Update,
-    time_str: str = None
-) -> int:
+async def save_and_finish(update: Update, time_str: str = None) -> int:
     chat_id = update.message.chat_id
     data = user_data[chat_id]
     today = get_today_date()
 
-    # если time_str явно не передан, берём из введённого
     t = time_str or data.get('time', '')
     reason = data.get('reason', '')
 
@@ -148,7 +175,6 @@ async def save_and_finish(
     )
     return ConversationHandler.END
 
-# общий список за сегодня
 async def send_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     records = att_sheet.get_all_records()
     today = get_today_date()
@@ -156,9 +182,9 @@ async def send_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for idx, r in enumerate(records, start=1):
         if r['Дата'] == today:
             name = r['Имя']
-            st   = r['Статус']
-            tm   = r.get('Время', '')
-            rsn  = r.get('Причина', '')
+            st = r['Статус']
+            tm = r.get('Время', '')
+            rsn = r.get('Причина', '')
             suffix = f"({rsn or tm})" if (rsn or tm) else ""
             lines.append(f"{idx}. {name} — {st} {suffix}")
     text = "📋 Список сотрудников сегодня:\n" + "\n".join(lines) if lines else "Сегодня ещё никто не отметил статус."
@@ -169,16 +195,13 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Отменено.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
-# --- Напоминание в 9:30 по будням ---
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     today = get_today_date()
-    # список уже отметившихся
     done = {
         r['Telegram ID']
         for r in att_sheet.get_all_records()
         if r['Дата'] == today
     }
-    # все сотрудники
     emps = emp_sheet.get_all_records()
     for r in emps:
         tid = str(r['Telegram ID'])
@@ -195,16 +218,15 @@ def main():
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            NEW_USER:        [MessageHandler(filters.TEXT & ~filters.COMMAND, new_user)],
+            NEW_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_user)],
             CHOOSING_STATUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, status_chosen)],
-            TYPING_TIME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, received_time)],
-            TYPING_REASON:   [MessageHandler(filters.TEXT & ~filters.COMMAND, received_reason)],
+            TYPING_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_time)],
+            TYPING_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_reason)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv)
 
-    # планировщик на будни (пон-пят) в 09:30
     jq = app.job_queue
     jq.run_daily(send_reminder, dt_time(hour=9, minute=30), days=(0,1,2,3,4))
 
