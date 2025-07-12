@@ -1,153 +1,139 @@
 import os
 import logging
-from datetime import datetime, time
-from typing import Dict
-
 import gspread
+from datetime import datetime, timedelta
 from oauth2client.service_account import ServiceAccountCredentials
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
-)
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ConversationHandler, ContextTypes, filters
 )
 
-# ——— Настройка логирования ———
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# ——— Константы состояний для ConversationHandler ———
-ASK_NAME, CHOOSE_STATUS, ASK_DETAILS = range(3)
-
-# ——— Клавиатура со статусами ———
-KEYBOARD = [
-    [KeyboardButton("Уже в офисе"), KeyboardButton("Удалённо")],
-    [KeyboardButton("Задерживаюсь"), KeyboardButton("DayOff")],
-    [KeyboardButton("В отпуске"), KeyboardButton("На съёмках")],
-]
-MARKUP = ReplyKeyboardMarkup(KEYBOARD, one_time_keyboard=True, resize_keyboard=True)
-
-# ——— Читаем переменные окружения ———
-SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-SHEET_EMPLOYEES = "Employees"
-SHEET_DATA = "Лист1"
-
+# CONFIG
 TOKEN = os.environ["TOKEN"]
-CRED_PATH = os.environ["SECRET_JSON"]  # например "/etc/secrets/credentials.json"
+SPREADSHEET_NAME = "Ежедневные Отметки"
+TIMEZONE_OFFSET = 5
 
-# ——— Подключаемся к Google Sheets ———
+# Google Sheets
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name(CRED_PATH, scope)
-gc = gspread.authorize(creds)
-sh = gc.open_by_key(SPREADSHEET_ID)
-ws_emp = sh.worksheet(SHEET_EMPLOYEES)
-ws_data = sh.worksheet(SHEET_DATA)
+creds = ServiceAccountCredentials.from_json_keyfile_name("/etc/secrets/credentials.json", scope)
+client = gspread.authorize(creds)
+sheet = client.open(SPREADSHEET_NAME).sheet1
 
+# States
+CHOOSING_STATUS, TYPING_TIME, TYPING_REASON = range(3)
+user_data_temp = {}
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Первый хендлер: спрашиваем имя, если не знаем."""
-    user_id = str(update.effective_user.id)
-    records = ws_emp.get_all_records()
-    # ищем Telegram ID в таблице
-    for row in records:
-        if str(row.get("Telegram ID", "")) == user_id:
-            context.user_data["name"] = row["Имя"]
-            await update.message.reply_text(
-                f"Привет, {row['Имя']}! Выбирай статус:", reply_markup=MARKUP
-            )
-            return CHOOSE_STATUS
+# Logging
+logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 
-    # если не нашли — спрашиваем имя
-    await update.message.reply_text("Как вас зовут? Введите имя:")
-    return ASK_NAME
+def get_today_date():
+    return (datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)).strftime("%d.%m.%Y")
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Загрузка меню...", reply_markup=ReplyKeyboardRemove())
 
-async def ask_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Сохраняем имя и переходим к выбору статуса."""
-    name = update.message.text.strip()
-    context.user_data["name"] = name
-    # записываем в Employees
-    ws_emp.append_row([name, str(update.effective_user.id)])
-    await update.message.reply_text(f"Спасибо, {name}! Теперь выбери статус:", reply_markup=MARKUP)
-    return CHOOSE_STATUS
+    keyboard = [
+        ["🏢 Уже в офисе"],
+        ["🏠 Удалённо", "🎬 На съёмках"],
+        ["🌴 В отпуске"],
+        ["📋 Список сотрудников"]
+    ]
+    markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    await update.message.reply_text("Привет! Где ты сегодня работаешь?", reply_markup=markup)
+    return CHOOSING_STATUS
 
+async def status_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
+    user_id = update.message.from_user.id
+    name = update.message.from_user.full_name
 
-async def save_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Сохраняем выбранный статус и, если нужно, спрашиваем детали."""
-    status = update.message.text.strip()
-    context.user_data["status"] = status
+    if text == "📋 Список сотрудников":
+        await send_sheet_data(update)
+        return ConversationHandler.END
 
-    # если нужно детали или причину
-    if status in ("Задерживаюсь", "Удалённо", "В отпуске", "На съёмках"):
-        prompt = {
-            "Задерживаюсь": "Во сколько будешь в офисе и по какой причине?",
-            "Удалённо": "По какой причине работаешь удалённо?",
-            "В отпуске": "Введите даты отпуска в формате с DD.MM по DD.MM",
-            "На съёмках": "Клиент и детали съёмок?",
-        }[status]
-        await update.message.reply_text(prompt)
-        return ASK_DETAILS
+    user_data_temp[user_id] = {
+        "name": name,
+        "status": text,
+        "telegram_id": user_id
+    }
 
-    # если DayOff — сразу пишем
-    await record_and_thanks(update, context, details="")
+    if text == "🌴 В отпуске":
+        await update.message.reply_text("Укажи даты отпуска (например: 11.07–20.07)")
+        return TYPING_REASON
+
+    elif text == "🏢 Уже в офисе":
+        return await save_and_thank(update, user_id, "")
+
+    else:
+        await update.message.reply_text("Во сколько будешь на связи или в офисе?")
+        return TYPING_TIME
+
+async def received_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    user_data_temp[user_id]["time"] = update.message.text
+    await update.message.reply_text("Если есть причина задержки — напиши. Если нет — напиши 'нет'")
+    return TYPING_REASON
+
+async def received_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.from_user.id
+    reason = update.message.text
+    return await save_and_thank(update, user_id, reason)
+
+async def save_and_thank(update, user_id, reason):
+    data = user_data_temp[user_id]
+    today = get_today_date()
+    row = [
+        today,
+        data["name"],
+        str(data["telegram_id"]),
+        data["status"],
+        data.get("time", ""),
+        reason,
+        ""
+    ]
+    sheet.append_row(row)
+    await update.message.reply_text("✅ Записано. Спасибо!")
     return ConversationHandler.END
 
+async def send_sheet_data(update: Update):
+    try:
+        records = sheet.get_all_records()
+        today = get_today_date()
+        text = "📋 Сегодня отметились:\n\n"
+        count = 0
+        for row in records:
+            if row.get("Дата") == today:
+                name = row.get("Имя", "—")
+                status = row.get("Статус", "")
+                time = row.get("Время", "")
+                text += f"• {name} — {status} ({time})\n"
+                count += 1
+        if count == 0:
+            text = "Сегодня ещё никто не отметился."
+        await update.message.reply_text(text)
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка чтения таблицы: {e}")
 
-async def ask_details(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Сохраняем детали и финализируем запись."""
-    details = update.message.text.strip()
-    await record_and_thanks(update, context, details)
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Окей, отменено.")
     return ConversationHandler.END
 
-
-async def record_and_thanks(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, details: str
-) -> None:
-    """Записываем строку в Google Sheet и благодарим пользователя."""
-    name = context.user_data["name"]
-    status = context.user_data["status"]
-    date_str = datetime.now().strftime("%d.%m.%Y")
-    # в колонку Причина пишем только для удалёнки и задержки
-    reason = details if status in ("Задерживаюсь", "Удалённо") else ""
-    # в колонку Детали: для отпуска и съёмок — туда же
-    det = details if status in ("В отпуске", "На съёмках") else details.split()[0] if status=="Задерживаюсь" else ""
-    # собираем row
-    row = [date_str, name, str(update.effective_user.id), status, det, reason]
-    ws_data.append_row(row)
-    await update.message.reply_text("Готово! Статус записан. Спасибо 🙏")
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Отмена диалога."""
-    await update.message.reply_text("ОК, отмена. Начнём сначала — /start")
-    return ConversationHandler.END
-
-
-def main() -> None:
+def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            ASK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_status)],
-            CHOOSE_STATUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_status)],
-            ASK_DETAILS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_details)],
+            CHOOSING_STATUS: [MessageHandler(filters.TEXT & ~filters.COMMAND, status_chosen)],
+            TYPING_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_time)],
+            TYPING_REASON: [MessageHandler(filters.TEXT & ~filters.COMMAND, received_reason)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
 
     app.add_handler(conv)
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
