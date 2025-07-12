@@ -5,11 +5,7 @@ from datetime import datetime, timedelta, time as dt_time
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-from telegram import (
-    Update,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove
-)
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -19,14 +15,10 @@ from telegram.ext import (
     filters,
 )
 
-import re
-
-# === КОНФИГ ===
 TOKEN = os.environ['TOKEN']
 SPREADSHEET_NAME = 'checkin-alt-bot'
-TIMEZONE_OFFSET = 5  # часовой пояс
+TIMEZONE_OFFSET = 5
 
-# === Google Sheets ===
 scope = [
     "https://spreadsheets.google.com/feeds",
     "https://www.googleapis.com/auth/drive"
@@ -38,14 +30,7 @@ client = gspread.authorize(creds)
 att_sheet = client.open(SPREADSHEET_NAME).sheet1
 emp_sheet = client.open(SPREADSHEET_NAME).worksheet('Employees')
 
-# === Состояния ConversationHandler ===
-(
-    NEW_USER,
-    CHOOSING_STATUS,
-    TYPING_TIME,
-    TYPING_REASON
-) = range(4)
-
+NEW_USER, CHOOSING_STATUS, TYPING_TIME, TYPING_REASON = range(4)
 user_data = {}
 
 logging.basicConfig(
@@ -55,70 +40,68 @@ logging.basicConfig(
 def get_today_date() -> str:
     return (datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)).strftime('%d.%m.%Y')
 
-def is_registered(chat_id: int) -> bool:
-    records = emp_sheet.get_all_records()
-    return any(str(chat_id) == str(r.get('Telegram ID')) for r in records)
-
-def parse_date_range(text):
-    match = re.match(r"(\d{2})\.(\d{2})\s*[–-]\s*(\d{2})\.(\d{2})", text)
-    if not match:
+def get_date_range_list(date_range_str: str) -> list:
+    try:
+        start_str, end_str = date_range_str.replace('–', '-').split('-')
+        today_year = datetime.utcnow().year
+        start = datetime.strptime(f"{start_str.strip()}.{today_year}", "%d.%m.%Y")
+        end = datetime.strptime(f"{end_str.strip()}.{today_year}", "%d.%m.%Y")
+        return [(start + timedelta(days=i)).strftime('%d.%m.%Y') for i in range((end - start).days + 1)]
+    except Exception:
         return []
-    d1, m1, d2, m2 = map(int, match.groups())
-    year = datetime.utcnow().year
-    start = datetime(year, m1, d1)
-    end = datetime(year, m2, d2)
-    return [(start + timedelta(days=i)).strftime('%d.%m.%Y') for i in range((end - start).days + 1)]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
+    name_exists = False
+    records = emp_sheet.get_all_records()
+    for r in records:
+        if str(r.get("Telegram ID")) == str(chat_id):
+            user_data[chat_id] = {'name': r['Имя']}
+            name_exists = True
+            break
 
-    if is_registered(chat_id):
-        records = emp_sheet.get_all_records()
-        user = next(r for r in records if str(r.get('Telegram ID')) == str(chat_id))
-        user_data[chat_id] = {'name': user['Имя']}
-
-        today = get_today_date()
-        all_att = att_sheet.get_all_records()
-        if any(str(chat_id) == str(r['Telegram ID']) and r['Дата'] == today for r in all_att):
-            keyboard = [['📋 Список сотрудников']]
-            await update.message.reply_text("⚠️ Вы уже отметили статус сегодня.", reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True))
-            return ConversationHandler.END
-
-        keyboard = [
-            ['🏢 Уже в офисе', '⏰ Задерживаюсь'],
-            ['🏠 Удалённо', '🎨 На съёмках'],
-            ['🌴 В отпуске', '🛌 Dayoff'],
-            ['🤒 На больничном'],
-            ['📋 Список сотрудников']
-        ]
+    if not name_exists:
         await update.message.reply_text(
-            f"Добро пожаловать снова, {user['Имя']}!\nВыберите статус на сегодня:",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            "Добро пожаловать! Пожалуйста, представьтесь:\nВведите Фамилию и Имя (на русском):",
+            reply_markup=ReplyKeyboardRemove()
         )
-        return CHOOSING_STATUS
+        return NEW_USER
 
+    all_att = att_sheet.get_all_records()
+    today = get_today_date()
+    if any(str(chat_id) == str(r.get('Telegram ID')) and r.get('Дата') == today for r in all_att):
+        await update.message.reply_text(
+            "Вы уже отметились сегодня. 📋 Список сотрудников доступен ниже.",
+            reply_markup=ReplyKeyboardMarkup([['📋 Список сотрудников']], resize_keyboard=True)
+        )
+        return ConversationHandler.END
+
+    keyboard = [
+        ['🏢 Уже в офисе'],
+        ['⏱ Задерживаюсь'],
+        ['🏠 Удалённо', '🎨 На съёмках'],
+        ['🌴 В отпуске', '🤒 На больничном'],
+        ['🛌 Dayoff'],
+        ['📋 Список сотрудников']
+    ]
     await update.message.reply_text(
-        "Добро пожаловать! Пожалуйста, представьтесь:\nВведите Фамилию и Имя (на русском):",
-        reply_markup=ReplyKeyboardRemove()
+        f"Спасибо, {user_data[chat_id]['name']}! Выберите ваш статус на сегодня:",
+        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     )
-    return NEW_USER
+    return CHOOSING_STATUS
 
 async def new_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     chat_id = update.message.chat_id
-
-    if is_registered(chat_id):
-        await update.message.reply_text("⚠️ Вы уже зарегистрированы.")
-        return ConversationHandler.END
-
     emp_sheet.append_row([text, chat_id])
     user_data[chat_id] = {'name': text}
 
     keyboard = [
-        ['🏢 Уже в офисе', '⏰ Задерживаюсь'],
+        ['🏢 Уже в офисе'],
+        ['⏱ Задерживаюсь'],
         ['🏠 Удалённо', '🎨 На съёмках'],
-        ['🌴 В отпуске', '🛌 Dayoff'],
-        ['🤒 На больничном'],
+        ['🌴 В отпуске', '🤒 На больничном'],
+        ['🛌 Dayoff'],
         ['📋 Список сотрудников']
     ]
     await update.message.reply_text(
@@ -142,77 +125,46 @@ async def status_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Укажите диапазон дат (например: 01.07–09.07):")
         return TYPING_REASON
 
-    if status == '⏰ Задерживаюсь':
-        await update.message.reply_text("Во сколько вы будете в офисе?")
-        return TYPING_TIME
+    if status == '⏱ Задерживаюсь':
+        await update.message.reply_text("На сколько задерживаетесь и по какой причине?")
+        return TYPING_REASON
 
-    prompt = "Во сколько вы на связи или в офисе?" if status in ('🎨 На съёмках', '🏠 Удалённо') else ""
-    await update.message.reply_text(prompt)
+    await update.message.reply_text("Во сколько вы на связи или в офисе?")
     return TYPING_TIME
 
 async def received_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     user_data[chat_id]['time'] = update.message.text.strip()
-
-    if user_data[chat_id]['status'] == '⏰ Задерживаюсь':
-        await update.message.reply_text("По какой причине вы задерживаетесь?")
-    else:
-        await update.message.reply_text("Укажите причину (или «нет»)" )
+    await update.message.reply_text("Укажите причину (или «нет»):")
     return TYPING_REASON
 
 async def received_reason(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
-    reason_text = update.message.text.strip()
-    user_data[chat_id]['reason'] = reason_text
-
+    user_data[chat_id]['reason'] = update.message.text.strip()
     status = user_data[chat_id]['status']
     if status in ('🌴 В отпуске', '🤒 На больничном'):
-        dates = parse_date_range(reason_text)
-        for date in dates:
-            row = [
-                date,
-                user_data[chat_id]['name'],
-                str(chat_id),
-                status,
-                '',
-                reason_text,
-                ''
-            ]
+        days = get_date_range_list(user_data[chat_id]['reason'])
+        for d in days:
+            row = [d, user_data[chat_id]['name'], str(chat_id), status, '', user_data[chat_id]['reason'], '']
             att_sheet.append_row(row)
-        keyboard = [['📋 Список сотрудников']]
-        await update.message.reply_text(
-            f"✅ Статус '{status}' записан на даты: {reason_text}.",
-            reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-        )
+        await update.message.reply_text("✅ Записано. Хорошего отдыха!", reply_markup=ReplyKeyboardMarkup([['📋 Список сотрудников']], resize_keyboard=True))
         return ConversationHandler.END
-
     return await save_and_finish(update)
 
 async def save_and_finish(update: Update, time_str: str = None) -> int:
     chat_id = update.message.chat_id
     data = user_data[chat_id]
     today = get_today_date()
-
     t = time_str or data.get('time', '')
     reason = data.get('reason', '')
 
-    row = [
-        today,
-        data['name'],
-        str(chat_id),
-        data['status'],
-        t,
-        reason,
-        ''
-    ]
+    row = [today, data['name'], str(chat_id), data['status'], t, reason, '']
     att_sheet.append_row(row)
 
-    keyboard = [['📋 Список сотрудников']]
     await update.message.reply_text(
         "✅ Записано. Хорошего дня!",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        reply_markup=ReplyKeyboardMarkup([['📋 Список сотрудников']], resize_keyboard=True)
     )
-
     return ConversationHandler.END
 
 async def send_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -220,15 +172,15 @@ async def send_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = get_today_date()
     lines = []
     for idx, r in enumerate(records, start=1):
-        if r['Дата'] == today:
-            name = r['Имя']
-            st = r['Статус']
+        if r.get('Дата') == today:
+            name = r.get('Имя')
+            st = r.get('Статус')
             tm = r.get('Время', '')
             rsn = r.get('Причина', '')
             suffix = f"({rsn or tm})" if (rsn or tm) else ""
             lines.append(f"{idx}. {name} — {st} {suffix}")
     text = "📋 Список сотрудников сегодня:\n" + "\n".join(lines) if lines else "Сегодня ещё никто не отметил статус."
-    await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(text, reply_markup=ReplyKeyboardMarkup([['📋 Список сотрудников']], resize_keyboard=True))
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -237,17 +189,15 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     today = get_today_date()
-    all_records = att_sheet.get_all_records()
-    done_today = {
-        r['Telegram ID']: r['Статус']
-        for r in all_records
-        if r['Дата'] == today
+    done = {
+        r.get('Telegram ID')
+        for r in att_sheet.get_all_records()
+        if r.get('Дата') == today and r.get('Статус') in ('🏢 Уже в офисе', '🌴 В отпуске', '🛌 Dayoff', '🤒 На больничном')
     }
     emps = emp_sheet.get_all_records()
     for r in emps:
-        tid = str(r['Telegram ID'])
-        status = done_today.get(tid)
-        if not status or status not in ('🏢 Уже в офисе', '🌴 В отпуске', '🛌 Dayoff', '🤒 На больничном'):
+        tid = str(r.get('Telegram ID'))
+        if tid and tid not in done:
             await context.bot.send_message(
                 chat_id=int(tid),
                 text="⏰ Не забудь указать свой статус, рабочий день начинается с 10:00."
@@ -268,9 +218,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     app.add_handler(conv)
-
-    # Глобальный хендлер кнопки "Список сотрудников"
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^📋 Список сотрудников$"), send_overview))
+    app.add_handler(MessageHandler(filters.Regex("📋 Список сотрудников"), send_overview))
 
     jq = app.job_queue
     jq.run_daily(send_reminder, dt_time(hour=9, minute=30), days=(0,1,2,3,4))
