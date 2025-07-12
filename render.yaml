@@ -1,10 +1,10 @@
 services:
-  - type: web           # или worker, если не нужен HTTP-порт
+  - type: web         # или worker, если не нужен HTTP-порт
     name: telegram-checkin-bot
     env: python
-    runtime: python3.10  # или ваша версия
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    runtime: python3.10
+    buildCommand: pip3 install -r requirements.txt
+    startCommand: python3 bot.py
     envVars:
       - key: TOKEN
         sync: false
