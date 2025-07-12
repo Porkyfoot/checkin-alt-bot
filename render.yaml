@@ -1,12 +1,14 @@
 services:
-  - type: worker         # не web, а background worker
+  - type: worker
     name: telegram-checkin-bot
-    env: python          # ключевой момент!
+    env: python
+    # Устанавливаем зависимости
     buildCommand: pip3 install -r requirements.txt
+    # Запускаем скрипт через python3
     startCommand: python3 bot.py
-    envVars:
-      - key: TOKEN
-        sync: false
     secretFiles:
       - name: credentials.json
         mountPath: /etc/secrets/credentials.json
+    envVars:
+      - key: TOKEN
+        sync: false
