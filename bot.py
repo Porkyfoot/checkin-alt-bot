@@ -21,7 +21,7 @@ from telegram.ext import (
 
 # === КОНФИГ ===
 TOKEN = os.environ['TOKEN']
-SPREADSHEET_NAME = 'Ежедневные Отметки'
+SPREADSHEET_NAME = 'checkin-alt-bot'
 TIMEZONE_OFFSET = 5  # часовой пояс
 
 # === Google Sheets ===
@@ -33,7 +33,7 @@ creds = ServiceAccountCredentials.from_json_keyfile_name(
     "/etc/secrets/credentials.json", scope
 )
 client = gspread.authorize(creds)
-att_sheet = client.open(SPREADSHEET_NAME).sheet1
+att_sheet = client.open(SPREADSHEET_NAME).Status
 emp_sheet = client.open(SPREADSHEET_NAME).worksheet('Employees')
 
 # === Состояния ConversationHandler ===
