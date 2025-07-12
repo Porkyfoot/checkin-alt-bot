@@ -30,7 +30,7 @@ EMPLOYEE_SHEET = "Employees"
 STATUS_SHEET = "Status"
 
 # Telegram
-TOKEN = "ваш-токен"
+TOKEN = "7591731653:AAEdN2b6HiF0jAvEtEP8n5hzhSbl94cu4fg"
 
 # Keyboard
 main_menu = ReplyKeyboardMarkup(
