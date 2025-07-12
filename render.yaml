@@ -1,8 +1,8 @@
 services:
-  - type: worker
+  - type: worker         # не web, а background worker
     name: telegram-checkin-bot
-    env: python
-    buildCommand: pip install -r requirements.txt
+    env: python          # ключевой момент!
+    buildCommand: pip3 install -r requirements.txt
     startCommand: python3 bot.py
     envVars:
       - key: TOKEN
