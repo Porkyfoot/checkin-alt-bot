@@ -1,13 +1,9 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
-import os
+# bot.py
 import logging
-import re
-from datetime import datetime, date, time as dtime
-
+from datetime import time, date
 import gspread
-from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
+from oauth2client.service_account import ServiceAccountCredentials
+from telegram import ReplyKeyboardMarkup, KeyboardButton, Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -17,190 +13,126 @@ from telegram.ext import (
     filters,
 )
 
-# ====== НАСТРОЙКИ GOOGLE SHEETS ======
-gc = gspread.service_account(filename="/etc/secrets/credentials.json")
-SPREADSHEET_ID = os.environ["SPREADSHEET_ID"]
-EMP_SHEET_NAME  = "Employees"
-STAT_SHEET_NAME = "Status"
+# --- константы состояний разговора ---
+(
+    STATE_NAME,
+    STATE_STATUS,
+    STATE_REMOTE_REASON,
+    STATE_SHOOT_DETAILS,
+    STATE_VACATION_DATES,
+) = range(5)
 
-emp_ws   = gc.open_by_key(SPREADSHEET_ID).worksheet(EMP_SHEET_NAME)
-stat_ws  = gc.open_by_key(SPREADSHEET_ID).worksheet(STAT_SHEET_NAME)
+# Google-сборы
+SCOPE = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+CREDS_FILE = "/etc/secrets/credentials.json"
+SPREADSHEET_ID = "ваш-ID-таблицы"
+EMPLOYEE_SHEET = "Employees"
+STATUS_SHEET = "Status"
 
-# ====== ЛОГГИРОВАНИЕ ======
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
+# Telegram
+TOKEN = "ваш-токен"
+
+# Keyboard
+main_menu = ReplyKeyboardMarkup(
+    [
+        [KeyboardButton("🏢 Уже в офисе"), KeyboardButton("🏠 Удалённо")],
+        [KeyboardButton("🎨 На съёмках"),    KeyboardButton("🌴 В отпуске")],
+        [KeyboardButton("📋 Список сотрудников")],
+    ],
+    resize_keyboard=True,
 )
 
-# ====== СТЕЙТЫ ======
-CHOOSING, REMOTE, SHOOT, VAC = range(4)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ====== КЛАВИАТУРА ======
-kb = [
-    ['🏢 Уже в офисе', '🏠 Удалённо'],
-    ['🎨 На съёмках',    '🌴 В отпуске'],
-    ['📋 Список сотрудников', 'DayOff'],
-]
-markup = ReplyKeyboardMarkup(kb, resize_keyboard=True, one_time_keyboard=True)
 
-# ====== УТИЛИТЫ ======
-def record_employee(name: str, tg_id: int):
-    recs = emp_ws.get_all_records()
-    ids  = {int(r["Telegram ID"]) for r in recs}
-    if tg_id not in ids:
-        emp_ws.append_row([name, tg_id])
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Привязка к Google
+    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPE)
+    client = gspread.authorize(creds)
+    emp_ws = client.open_by_key(SPREADSHEET_ID).worksheet(EMPLOYEE_SHEET)
+    # если юзер новый — спросим имя
+    rows = emp_ws.get_all_records()
+    ids = [str(r["Telegram ID"]) for r in rows]
+    if str(update.effective_user.id) not in ids:
+        await update.message.reply_text("Пожалуйста, представьтесь: Фамилия Имя (русскими буквами).")
+        return STATE_NAME
 
-def record_status(name, tg_id, status, detail, reason):
-    today = date.today().strftime("%d.%m.%Y")
-    stat_ws.append_row([today, name, tg_id, status, detail, reason])
-
-def parse_vac(text: str):
-    parts = re.split(r"[–-]", text.strip())
-    def to_dt(s):
-        for fmt in ("%d.%m.%Y","%d.%m"):
-            try:
-                dt = datetime.strptime(s.strip(),fmt).date()
-                if fmt=="%d.%m":
-                    dt = dt.replace(year=date.today().year)
-                return dt
-            except:
-                pass
-        raise ValueError
-    return to_dt(parts[0]), to_dt(parts[1])
-
-def is_on_vac(tg_id:int):
-    today = date.today()
-    for r in stat_ws.get_all_records():
-        if int(r["Telegram ID"])!=tg_id: continue
-        if r["Статус"]!="🌴 В отпуске": continue
-        try:
-            start,end = parse_vac(r["Причина"])
-        except: continue
-        if start<=today<=end: return True
-    return False
-
-# ====== HANDLERS ======
-async def start(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if "name" not in ctx.user_data:
-        await update.message.reply_text(
-            "Привет! Представься: имя и фамилию на русском.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return CHOOSING
-    await update.message.reply_text("Выбери статус:", reply_markup=markup)
-    return CHOOSING
-
-async def name_h(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    name  = update.message.text.strip()
-    tg_id = update.effective_user.id
-    ctx.user_data["name"] = name
-    record_employee(name, tg_id)
     await update.message.reply_text(
-        f"✅ Записали: {name}\nТеперь выбери статус:", reply_markup=markup
+        "Выбери статус на сегодня:", 
+        reply_markup=main_menu
     )
-    return CHOOSING
+    return STATE_STATUS
 
-async def choose(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    txt   = update.message.text
-    tg_id = update.effective_user.id
-    name  = ctx.user_data.get("name","?")
-    if txt=="🏠 Удалённо":
-        await update.message.reply_text("Причина удалёнки?", reply_markup=ReplyKeyboardRemove())
-        return REMOTE
-    if txt=="🎨 На съёмках":
-        await update.message.reply_text("Что за съёмки?", reply_markup=ReplyKeyboardRemove())
-        return SHOOT
-    if txt=="🌴 В отпуске":
-        await update.message.reply_text("Даты отпускa (01.07–09.07):", reply_markup=ReplyKeyboardRemove())
-        return VAC
-    if txt=="🏢 Уже в офисе":
-        now = datetime.now().strftime("%H:%M")
-        record_status(name, tg_id, "🏢 В офисе", now, "")
-        await update.message.reply_text(f"✅ Офис: {now}", reply_markup=markup)
-        return ConversationHandler.END
-    if txt=="DayOff":
-        record_status(name, tg_id, "DayOff", "", "")
-        await update.message.reply_text("✅ DayOff", reply_markup=markup)
-        return ConversationHandler.END
-    if txt=="📋 Список сотрудников":
-        today = date.today().strftime("%d.%m.%Y")
-        lines = []
-        for r in stat_ws.get_all_records():
-            if r["Дата"]!=today: continue
-            det = r["Детали"] or ""
-            rea = r["Причина"] or ""
-            lines.append(
-              f"{r['Имя']} — {r['Статус']}"+(
-              f" ({det})" if det else "")+(
-              f" ({rea})" if rea else "")
-            )
-        msg = "Нет записей." if not lines else "Сотрудники:\n" + "\n".join(lines)
-        await update.message.reply_text(msg, reply_markup=markup)
-        return ConversationHandler.END
-    # иначе
-    await update.message.reply_text("Нажми на кнопку меню.", reply_markup=markup)
-    return CHOOSING
 
-async def save_remote(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    rea = update.message.text.strip()
-    name,tg = ctx.user_data["name"], update.effective_user.id
-    record_status(name,tg,"🏠 Удалённо","",rea)
-    await update.message.reply_text("✅ Удалёнка",reply_markup=markup)
+async def name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPE)
+    client = gspread.authorize(creds)
+    emp_ws = client.open_by_key(SPREADSHEET_ID).worksheet(EMPLOYEE_SHEET)
+
+    fullname = update.message.text.strip()
+    emp_ws.append_row([fullname, str(update.effective_user.id)])
+    await update.message.reply_text("Записал. Теперь выбери статус:", reply_markup=main_menu)
+    return STATE_STATUS
+
+
+# ——— Тут ваши хендлеры на каждый статус (удалёнка, съёмки, отпуск) ———
+# каждый хендлер в конце делает STATE = ConversationHandler.END
+
+
+async def show_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    creds = ServiceAccountCredentials.from_json_keyfile_name(CREDS_FILE, SCOPE)
+    client = gspread.authorize(creds)
+    status_ws = client.open_by_key(SPREADSHEET_ID).worksheet(STATUS_SHEET)
+
+    today = date.today().strftime("%d.%m.%Y")
+    records = status_ws.get_all_records()
+    lines = [r for r in records if r["Дата"] == today]
+    text = "Список сотрудников сегодня:\n\n"
+    for i, r in enumerate(lines, 1):
+        text += (
+            f"{i}. {r['Имя']} — {r['Статус']} "
+            f"({r['Причина'] or r['Время']})\n"
+        )
+    await update.message.reply_text(text)
     return ConversationHandler.END
 
-async def save_shoot(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    det = update.message.text.strip()
-    name,tg = ctx.user_data["name"], update.effective_user.id
-    record_status(name,tg,"🎨 На съёмках",det,"")
-    await update.message.reply_text("✅ Съёмки",reply_markup=markup)
-    return ConversationHandler.END
 
-async def save_vac(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    period = update.message.text.strip()
-    name,tg = ctx.user_data["name"], update.effective_user.id
-    record_status(name,tg,"🌴 В отпуске",period,"")
-    await update.message.reply_text(f"✅ Отпуск: {period}",reply_markup=markup)
-    return ConversationHandler.END
+def build_application():
+    return (
+        ApplicationBuilder()
+        .token(TOKEN)
+        .build()
+    )
 
-async def cancel(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Отменено.",reply_markup=markup)
-    return ConversationHandler.END
-
-# ====== MAIN ======
 
 def main():
-    TOKEN = os.environ["TOKEN"]
-    APP_URL = os.environ["APP_URL"]  # например: https://your-app.onrender.com
+    app = build_application()
 
-    app = ApplicationBuilder()\
-        .token(TOKEN)\
-        .build()
-
+    # ConversationHandler
     conv = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            CHOOSING: [MessageHandler(filters.TEXT & ~filters.COMMAND, choose)],
-            REMOTE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, save_remote)],
-            SHOOT:    [MessageHandler(filters.TEXT & ~filters.COMMAND, save_shoot)],
-            VAC:      [MessageHandler(filters.TEXT & ~filters.COMMAND, save_vac)],
+            STATE_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, name_handler)],
+            STATE_STATUS: [
+                MessageHandler(filters.Regex("^🏢 Уже в офисе$"),      handle_office),
+                MessageHandler(filters.Regex("^🏠 Удалённо$"),        handle_remote),
+                MessageHandler(filters.Regex("^🎨 На съёмках$"),      handle_shoot),
+                MessageHandler(filters.Regex("^🌴 В отпуске$"),       handle_vacation),
+                MessageHandler(filters.Regex("^📋 Список сотрудников$"), show_list),
+            ],
+            # и далее переходы для других состояний...
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_user=True,
+        fallbacks=[CommandHandler("start", start)],
     )
     app.add_handler(conv)
 
-    # устанавливаем вебхук
-    webhook_path = TOKEN.split(":")[0]  # какой-нибудь уникальный путь
-    final_url   = f"{APP_URL}/{webhook_path}"
-    app.bot.set_webhook(final_url)
+    # Ежедневное напоминание
+    remind_time = time(hour=9, minute=30)
+    app.job_queue.run_daily(send_reminder, remind_time, days=(0,1,2,3,4))
 
-    # запускаем HTTP-сервер, который будет принимать POST /<webhook_path>
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", 80)),
-        webhook_path=f"/{webhook_path}"
-    )
+    app.run_polling()
+
 
 if __name__ == "__main__":
     main()
