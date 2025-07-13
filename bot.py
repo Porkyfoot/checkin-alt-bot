@@ -40,15 +40,15 @@ logging.basicConfig(
 def get_today_date() -> str:
     return (datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)).strftime('%d.%m.%Y')
 
-def get_now_time() -> str:
+def get_time_now() -> str:
     return (datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)).strftime('%H:%M')
 
 def get_date_range_list(date_range_str: str) -> list:
     try:
         start_str, end_str = date_range_str.replace('–', '-').split('-')
-        year = datetime.utcnow().year
-        start = datetime.strptime(f"{start_str.strip()}.{year}", "%d.%m.%Y")
-        end = datetime.strptime(f"{end_str.strip()}.{year}", "%d.%m.%Y")
+        today_year = datetime.utcnow().year
+        start = datetime.strptime(f"{start_str.strip()}.{today_year}", "%d.%m.%Y")
+        end = datetime.strptime(f"{end_str.strip()}.{today_year}", "%d.%m.%Y")
         return [(start + timedelta(days=i)).strftime('%d.%m.%Y') for i in range((end - start).days + 1)]
     except Exception:
         return []
@@ -72,7 +72,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     all_att = att_sheet.get_all_records()
     today = get_today_date()
-    if any(str(chat_id) == str(r.get('ID')) and str(r.get('Дата')) == today for r in all_att):
+    if any(str(chat_id) == str(r.get('ID')) and r.get('Дата') == today for r in all_att):
         await update.message.reply_text(
             "Вы уже отметились сегодня. 📋 Список сотрудников доступен ниже.",
             reply_markup=ReplyKeyboardMarkup([['📋 Список сотрудников']], resize_keyboard=True)
@@ -122,8 +122,7 @@ async def status_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await send_overview(update, context)
 
     if status == '🏢 Уже в офисе':
-        now_time = get_now_time()
-        return await save_and_finish(update, time_str=now_time)
+        return await save_and_finish(update, time_str=get_time_now())
 
     if status in ('🌴 В отпуске', '🤒 На больничном'):
         await update.message.reply_text("Укажите диапазон дат (например: 01.07–09.07):")
@@ -179,7 +178,7 @@ async def send_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if r.get('Дата') == today:
             name = r.get('Имя')
             st = r.get('Статус')
-            tm = r.get('Время', '')
+            tm = r.get('Детали', '')
             rsn = r.get('Причина', '')
             suffix = f"({rsn or tm})" if (rsn or tm) else ""
             lines.append(f"{idx}. {name} — {st} {suffix}")
