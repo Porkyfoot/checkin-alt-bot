@@ -27,7 +27,7 @@ creds = ServiceAccountCredentials.from_json_keyfile_name(
     "/etc/secrets/credentials.json", scope
 )
 client = gspread.authorize(creds)
-att_sheet = client.open(SPREADSHEET_NAME).sheet1
+att_sheet = client.open(SPREADSHEET_NAME).worksheet('Status')
 emp_sheet = client.open(SPREADSHEET_NAME).worksheet('Employees')
 
 NEW_USER, CHOOSING_STATUS, TYPING_TIME, TYPING_REASON = range(4)
@@ -40,7 +40,7 @@ logging.basicConfig(
 def get_today_date() -> str:
     return (datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)).strftime('%d.%m.%Y')
 
-def get_time_now() -> str:
+def get_now_time() -> str:
     return (datetime.utcnow() + timedelta(hours=TIMEZONE_OFFSET)).strftime('%H:%M')
 
 def get_date_range_list(date_range_str: str) -> list:
@@ -98,20 +98,7 @@ async def new_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     emp_sheet.append_row([text, chat_id])
     user_data[chat_id] = {'name': text}
-
-    keyboard = [
-        ['🏢 Уже в офисе'],
-        ['⏱ Задерживаюсь'],
-        ['🏠 Удалённо', '🎨 На съёмках'],
-        ['🌴 В отпуске', '🤒 На больничном'],
-        ['🛌 Dayoff'],
-        ['📋 Список сотрудников']
-    ]
-    await update.message.reply_text(
-        f"Спасибо, {text}! Выберите ваш статус на сегодня:",
-        reply_markup=ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    )
-    return CHOOSING_STATUS
+    return await start(update, context)
 
 async def status_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = update.message.text
@@ -122,7 +109,7 @@ async def status_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return await send_overview(update, context)
 
     if status == '🏢 Уже в офисе':
-        return await save_and_finish(update, time_str=get_time_now())
+        return await save_and_finish(update, time_str=get_now_time())
 
     if status in ('🌴 В отпуске', '🤒 На больничном'):
         await update.message.reply_text("Укажите диапазон дат (например: 01.07–09.07):")
@@ -178,7 +165,7 @@ async def send_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if r.get('Дата') == today:
             name = r.get('Имя')
             st = r.get('Статус')
-            tm = r.get('Детали', '')
+            tm = r.get('Время', '')
             rsn = r.get('Причина', '')
             suffix = f"({rsn or tm})" if (rsn or tm) else ""
             lines.append(f"{idx}. {name} — {st} {suffix}")
@@ -186,9 +173,29 @@ async def send_overview(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=ReplyKeyboardMarkup([['📋 Список сотрудников']], resize_keyboard=True))
     return ConversationHandler.END
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Отменено.", reply_markup=ReplyKeyboardRemove())
-    return ConversationHandler.END
+async def send_daily_overview_to_all(context: ContextTypes.DEFAULT_TYPE):
+    records = att_sheet.get_all_records()
+    today = get_today_date()
+    lines = []
+    for idx, r in enumerate(records, start=1):
+        if r.get('Дата') == today:
+            name = r.get('Имя')
+            st = r.get('Статус')
+            tm = r.get('Время', '')
+            rsn = r.get('Причина', '')
+            suffix = f"({rsn or tm})" if (rsn or tm) else ""
+            lines.append(f"{idx}. {name} — {st} {suffix}")
+
+    text = "📋 Список сотрудников сегодня:\n" + "\n".join(lines) if lines else "Сегодня ещё никто не отметил статус."
+
+    employees = emp_sheet.get_all_records()
+    for emp in employees:
+        tid = emp.get("Telegram ID")
+        if tid:
+            try:
+                await context.bot.send_message(chat_id=int(tid), text=text)
+            except Exception as e:
+                logging.warning(f"Не удалось отправить список {tid}: {e}")
 
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     today = get_today_date()
@@ -201,10 +208,17 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     for r in emps:
         tid = str(r.get('Telegram ID'))
         if tid and tid not in done:
-            await context.bot.send_message(
-                chat_id=int(tid),
-                text="⏰ Не забудь указать свой статус, рабочий день начинается с 10:00."
-            )
+            try:
+                await context.bot.send_message(
+                    chat_id=int(tid),
+                    text="⏰ Не забудь указать свой статус, рабочий день начинается с 10:00."
+                )
+            except Exception as e:
+                logging.warning(f"Не удалось отправить напоминание {tid}: {e}")
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Отменено.", reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
 
 def main():
     logging.getLogger().setLevel(logging.INFO)
@@ -220,11 +234,13 @@ def main():
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
+
     app.add_handler(conv)
     app.add_handler(MessageHandler(filters.Regex("📋 Список сотрудников"), send_overview))
 
     jq = app.job_queue
     jq.run_daily(send_reminder, dt_time(hour=9, minute=30), days=(0,1,2,3,4))
+    jq.run_daily(send_daily_overview_to_all, dt_time(hour=10, minute=30), days=(0,1,2,3,4))
 
     app.run_polling()
 
